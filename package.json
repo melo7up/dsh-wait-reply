@@ -1,0 +1,32 @@
+{
+  "name": "dsh-wait-reply",
+  "version": "0.1.0",
+  "description": "Holds a root turn open until its sub-agent results arrive, then continues in that same turn.",
+  "license": "MIT",
+  "type": "module",
+  "exports": {
+    ".": "./index.js",
+    "./locale/*.json": "./locale/*.json",
+    "./icon": "./icon.svg"
+  },
+  "files": [
+    "index.js",
+    "cordis.patch.yml",
+    "locale/en.json",
+    "locale/zh.json",
+    "icon.svg",
+    "README.md",
+    "LICENSE"
+  ],
+  "engines": {
+    "dsh": "0.2.2-rc.1"
+  },
+  "scripts": {
+    "test": "node --test test/compat.test.mjs && node test/isolate.mjs"
+  },
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    }
+  }
+}

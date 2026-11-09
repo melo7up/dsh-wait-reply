@@ -1,0 +1,6 @@
+{
+  "meta": {
+    "title": "Wait for replies",
+    "description": "Holds the root turn open until sub-agent results arrive, then continues in that same turn."
+  }
+}
