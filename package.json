@@ -1,7 +1,7 @@
 {
   "name": "dsh-wait-reply",
-  "version": "0.1.0",
-  "description": "Holds a root turn open until its sub-agent results arrive, then continues in that same turn.",
+  "version": "0.1.1",
+  "description": "Waits for child and background results, then requests a complete final answer in the same root turn.",
   "license": "MIT",
   "type": "module",
   "exports": {

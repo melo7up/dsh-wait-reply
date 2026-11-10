@@ -5,6 +5,7 @@ import { mkdir, mkdtemp, readFile, symlink, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { pathToFileURL, fileURLToPath } from 'node:url'
+import vm from 'node:vm'
 
 const pluginDir = fileURLToPath(new URL('..', import.meta.url))
 const fixtureDir = fileURLToPath(new URL('./fixtures/incompatible-bundle/', import.meta.url))
@@ -63,6 +64,36 @@ const deadline = setTimeout(() => {
 let current
 const owners = new Map()
 const checks = []
+
+// Execute the installed UI's answer selector, so the assertion covers what
+// "Final answer only" actually keeps rather than just counting turn/end.
+const uiSource = await readFile(join(packages, 'dsh-client-ui-chat/lib/client.js'), 'utf8')
+const uiSection = (start, end) => {
+  const offset = uiSource.indexOf(start)
+  assert.ok(offset >= 0, `UI selector missing: ${start}`)
+  const limit = uiSource.indexOf(end, offset)
+  assert.ok(limit > offset, `UI selector boundary missing: ${end}`)
+  return uiSource.slice(offset, limit)
+}
+const ui = vm.createContext({})
+vm.runInContext(uiSection('function hasAssistantReplyContent(blocks)', '\n\t\t//#endregion')
+  + uiSection('function isFinalAssistant(data)', '\n\t\tfunction processSpec('), ui)
+
+function selectedAnswer(agent) {
+  const events = agent.session.snapshotEvents()
+  const turn = events.findLast((event) => event.type === 'turn/end')?.data.turn
+  const steps = events.filter((event) => event.type === 'assistant/message' && event.data.turn === turn).map((event) => ({
+    data: new Map([['assistant-step', {
+      step: event.data.step,
+      finalNode: { seq: event.seq },
+      blocks: event.data.message.content.map((block) => ({ ...block, kind: block.type })),
+    }]]),
+  }))
+  return ui.latestAnswer({ steps })?.blocks.filter((block) => block.kind === 'text').map((block) => block.text).join('\n')
+}
+
+const reviewSummary = '## Standards\nREVIEW_RESULT\n\n## Spec\nSPEC_RESULT\n\n## 验证\nVALIDATION_RESULT'
+const supplement = '补充刚拿到的日志：MILVUS_404，API 暂不可用。'
 
 function packagesDir() {
   const flag = process.argv.indexOf('--packages')
@@ -163,6 +194,48 @@ const adapter = {
       return
     }
     const agent = state.agent
+    const closingRequests = agent.session.snapshotEvents().filter((event) => event.type === 'user/message'
+      && event.data.source.kind === 'dsh-wait-reply')
+    if (closingRequests.length > (state.closingRequests ?? 0)) {
+      state.closingRequests = closingRequests.length
+      if (state.finalAnswerCase) {
+        const request = closingRequests.at(-1).data.content.map((block) => block.text ?? '').join('\n')
+        assert.match(request, /self-contained/i)
+        assert.match(request, /REVIEW_RESULT/)
+        assert.match(request, /MILVUS_404/)
+        yield* textChunks(`${reviewSummary}\n\n## 环境\n${supplement}`)
+      } else {
+        yield* textChunks('FINAL_ALL_RESULTS (consolidated)')
+      }
+      return
+    }
+    if (state.finalAnswerCase) {
+      if (!state.jobId) {
+        state.jobId = ctx.jobs.start({
+          kind: 'bash', owner: agent.id, label: 'Offline Milvus log probe',
+          run(handle) {
+            return {
+              done: state.jobGate.promise.then(() => {
+                handle.append(`MILVUS_404\n${'log line\n'.repeat(400)}`)
+                return { status: state.jobFailure ? 'failed' : 'completed', detail: 'offline fixture' }
+              }),
+              cancel() { state.jobGate.resolve() },
+            }
+          },
+        })
+        if (state.queuedJob) {
+          state.jobGate.resolve()
+          await until(() => agent.inbox.nextStep.some((message) => message.source.kind === 'tool-jobs'), 'job notice queued before main summary')
+        }
+        yield* textChunks(reviewSummary)
+      } else if (!state.collectedJob) {
+        state.collectedJob = true
+        yield* toolChunks([['job_output', { job_id: state.jobId }]])
+      } else {
+        yield* textChunks(supplement)
+      }
+      return
+    }
     if (state.goal && !state.createdGoal) {
       state.createdGoal = true
       yield* toolChunks([['create_goal', { objective: 'Collect both child results and provide one closing answer.', max_goal_rounds: 5 }]])
@@ -248,6 +321,7 @@ function summarize(state, extra = {}) {
     finalSummaries: events.filter((event) => event.type === 'assistant/message' && event.data.message.content.some((block) => block.type === 'text' && block.text === 'FINAL_ALL_RESULTS')).length,
     userSources: userSources.length,
     settledSources: settled.length,
+    closingRequests: events.filter((event) => event.type === 'user/message' && event.data.source.kind === 'dsh-wait-reply').length,
     ...extra,
   }
 }
@@ -304,6 +378,69 @@ async function runCase(hold, goal, extra = {}) {
   return result
 }
 
+async function runFinalAnswerCase(extra = {}) {
+  const state = await startCase({ noChildren: true, finalAnswerCase: true, jobGate: deferred(), ...extra })
+  if (!state.queuedJob) {
+    await until(() => state.agent.session.snapshotEvents().some((event) => event.type === 'assistant/message'
+      && event.data.message.content.some((block) => block.text === reviewSummary)), 'main summary before delayed job settles')
+    await new Promise((done) => setTimeout(done, 40))
+    assert.equal(state.agent.status, 'running', 'a live owned background job must hold the turn')
+    assert.equal(hasTurnEnd(state.agent), false)
+    state.jobGate.resolve()
+  }
+  await state.agent.whenIdle()
+  const selected = selectedAnswer(state.agent)
+  for (const required of ['## Standards', 'REVIEW_RESULT', '## Spec', 'SPEC_RESULT', 'VALIDATION_RESULT', 'MILVUS_404']) {
+    assert.ok(selected?.includes(required), `Final-answer-only lost ${required}: ${selected}`)
+  }
+  assert.equal(summarize(state).completedTurns, 1)
+  assert.equal(summarize(state).userSources, 1, 'internal synthesis must not impersonate a human')
+  assert.equal(state.closingRequests, 1, 'one synthesis pass without a retry loop')
+  assert.equal(ctx.jobs.get(state.jobId, state.agent.id).status, state.jobFailure ? 'failed' : 'completed')
+  checks.push({ case: extra.label, finalOnlyComplete: true, ...summarize(state) })
+  return state
+}
+
+async function runJobReleaseCase(cancel) {
+  const state = await startCase({ noChildren: true, finalAnswerCase: true, jobGate: deferred() })
+  await until(() => state.agent.session.snapshotEvents().some((event) => event.type === 'assistant/message'
+    && event.data.message.content.some((block) => block.text === reviewSummary)), 'summary before releasing background wait')
+  await new Promise((done) => setTimeout(done, 40))
+  assert.equal(state.agent.status, 'running')
+  if (cancel) state.agent.cancel({ kind: 'user' })
+  else await setEnabled(false)
+  await until(() => state.agent.status === 'idle', 'background wait released')
+  assert.equal(ctx.jobs.get(state.jobId, state.agent.id).status, 'running', 'the plugin must not cancel jobs')
+  assert.equal(summarize(state).closingRequests, 0)
+  const end = state.agent.session.snapshotEvents().findLast((event) => event.type === 'turn/end')
+  assert.equal(end.data.reason.kind, cancel ? 'aborted' : 'completed')
+  state.jobGate.resolve()
+  await until(() => ctx.jobs.get(state.jobId, state.agent.id).status === 'completed', 'released job still completes')
+  await state.agent.whenIdle()
+  if (!cancel) await setEnabled(true)
+  checks.push({ case: cancel ? 'cancel during background wait' : 'disable during background wait', jobsCancelled: false })
+}
+
+async function checkJobScope(state) {
+  const gate = deferred()
+  const spec = {
+    kind: 'bash', label: 'Existing server outside the next turn',
+    run() { return { done: gate.promise.then(() => ({ status: 'completed' })), cancel() { gate.resolve() } } },
+  }
+  const owned = ctx.jobs.start({ ...spec, owner: state.agent.id })
+  const unowned = ctx.jobs.start(spec)
+  state.finalAnswerCase = false
+  state.agent.followup(createUserMessage({ content: [{ type: 'text', text: 'A separate ordinary question.' }], source: { kind: 'user' } }))
+  await until(() => summarize(state).completedTurns === 2, 'ordinary answer ignores earlier-turn and unowned jobs')
+  assert.equal(ctx.jobs.get(owned, state.agent.id).status, 'running')
+  assert.equal(ctx.jobs.get(unowned).status, 'running')
+  assert.equal(summarize(state).closingRequests, 1, 'ordinary answer must not add another synthesis pass')
+  gate.resolve()
+  await until(() => ctx.jobs.get(owned, state.agent.id).status === 'completed', 'older job completes')
+  await state.agent.whenIdle()
+  checks.push({ case: 'earlier-turn and unowned jobs do not block an ordinary answer', noExtraSynthesis: true })
+}
+
 try {
   assert.equal(globalThis.__DSH_WAIT_REPLY_INCOMPATIBLE_IMPORTED__, undefined)
   const loaded = await pluginRow()
@@ -321,6 +458,12 @@ try {
 
   await setEnabled(true)
   assert.match(await renderedPrompt(), /keeps that root turn open/)
+  const queuedJob = await runFinalAnswerCase({ queuedJob: true, label: 'summary then queued background result' })
+  await runFinalAnswerCase({ label: 'summary then delayed background result' })
+  await runFinalAnswerCase({ jobFailure: true, label: 'failed background job still gets a complete closing answer' })
+  await checkJobScope(queuedJob)
+  await runJobReleaseCase(true)
+  await runJobReleaseCase(false)
   const joined = await runCase(true, true, { label: 'plugin with goal and two children' })
   assert.equal(joined.completedTurns, 1)
   assert.equal(joined.authorityErrors, 0)
@@ -330,6 +473,7 @@ try {
   assert.equal(noGoal.finalSummaries, 1)
   const noChildren = await runCase(true, false, { noChildren: true, label: 'plugin with no children' })
   assert.equal(noChildren.completedTurns, 1)
+  assert.equal(noChildren.closingRequests, 0)
   const steering = await runCase(true, true, { userSteer: true, label: 'plugin with user steering' })
   assert.equal(steering.completedTurns, 1)
   assert.equal(steering.authorityErrors, 0)

@@ -1,6 +1,6 @@
 {
   "meta": {
     "title": "Wait for replies",
-    "description": "Holds the root turn open until sub-agent results arrive, then continues in that same turn."
+    "description": "Waits for child and current-turn background results, then requests a complete final answer in the same turn."
   }
 }

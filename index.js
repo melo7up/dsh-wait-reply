@@ -1,7 +1,8 @@
 import { readFileSync } from 'node:fs'
 import { join } from 'node:path'
+import { randomUUID } from 'node:crypto'
 
-// Holds a root turn open until host-managed sub-agent work settles.
+// Holds a root turn open until child and current-turn background work settles.
 // Does not cancel children, rewrite message sources, or decide task success.
 export const name = 'dsh-wait-reply'
 export const inject = ['agents', 'subagents']
@@ -12,7 +13,9 @@ const GUIDANCE = [
   'When sub-agent work is still outstanding, end the turn as usual.',
   'This session keeps that root turn open until those results arrive or the user sends another message, then continues in the same turn.',
   'Integrate and verify the results before one closing answer.',
-  'Do not write a final summary or mark a goal complete while required child work is still outstanding.',
+  'Collect relevant background job results as well as child results before the closing answer.',
+  'The final reply must be self-contained: earlier replies are hidden in final-answer-only mode. After late results, restate the complete updated conclusions, changes, verification, and remaining problems instead of only adding a supplement.',
+  'Do not write a final summary or mark a goal complete while required child or background work is still outstanding.',
   'A child finishing, failing, being cancelled, or going idle is not by itself task success.',
   'Do not cancel sub-agents in order to finish the turn.',
 ].join(' ')
@@ -137,6 +140,7 @@ async function joinRoot(ctx, payload, releases) {
 
   let onAbort
   let release
+  let stopJobs
   const released = new Promise((resolve) => {
     release = () => resolve('released')
     releases.add(release)
@@ -154,23 +158,88 @@ async function joinRoot(ctx, payload, releases) {
     (kind) => ({ kind }),
     (error) => ({ kind: 'abort', error }),
   )
-  const children = ctx.subagents.waitForChildren(agent).then(
-    (observed) => ({ kind: 'children', observed }),
-    (error) => ({ kind: 'children-error', error }),
-  )
   try {
+    const jobs = observeJobs(ctx, agent, payload.turn)
+    stopJobs = jobs.dispose
+    // Observe job settlement without jobs.wait/read: those calls would suppress
+    // the host's completion notice or consume output before the model sees it.
+    const work = Promise.all([ctx.subagents.waitForChildren(agent), jobs.promise]).then(
+      () => ({ kind: 'work' }),
+      (error) => ({ kind: 'work-error', error }),
+    )
     const winner = await Promise.race([
-      children,
+      work,
       inputSettled,
       released.then((kind) => ({ kind })),
     ])
-    if (winner.kind === 'abort' || winner.kind === 'children-error') throw winner.error
+    if (winner.kind === 'abort' || winner.kind === 'work-error') throw winner.error
+    if (winner.kind === 'released') return
+    if (!signal.aborted && agent.inbox.nextStep.length === 0) requestClosingAnswer(agent, payload.turn)
   } finally {
     releases.delete(release)
     settle('dropped')
     try { offInbox?.() } catch { /* unload already removed the listener */ }
+    try { stopJobs?.() } catch { /* same */ }
     signal.removeEventListener('abort', onAbort)
   }
+}
+
+function turnEvents(agent, turn) {
+  const events = agent.session.snapshotEvents()
+  const start = events.findLastIndex((event) => event.type === 'turn/start' && event.data.turn === turn)
+  return start < 0 ? [] : events.slice(start)
+}
+
+function observeJobs(ctx, agent, turn) {
+  const jobs = ctx.get('jobs')
+  if (jobs === undefined) return { promise: Promise.resolve() }
+  const ids = new Set(turnEvents(agent, turn).filter((event) => event.type === 'job/registered').map((event) => event.data.jobId))
+  let resolve
+  const promise = new Promise((done) => { resolve = done })
+  const check = () => {
+    if (!jobs.list(agent.id).some((job) => job.owner === agent.id && ids.has(job.id)
+      && (job.status === 'running' || job.status === 'stopping'))) resolve()
+  }
+  const dispose = jobs.events.subscribe({ owner: agent.id }, (event) => {
+    if (event.job.owner !== agent.id) return
+    if (event.type === 'registered') ids.add(event.job.id)
+    check()
+  })
+  check()
+  return { promise, dispose }
+}
+
+function requestClosingAnswer(agent, turn) {
+  let replies = []
+  let resumed = false
+  for (const event of turnEvents(agent, turn)) {
+    if (event.type === 'user/message') {
+      const kind = event.data.source.kind
+      if (kind === name || kind === 'user') {
+        replies = []
+        resumed = false
+      } else if ((kind === 'subagent-settled' || kind === 'tool-jobs') && replies.length > 0) {
+        resumed = true
+      }
+    }
+    if (event.type !== 'assistant/message') continue
+    const blocks = event.data.message.content
+    if (blocks.some((block) => block.type === 'tool-call')) continue
+    const text = blocks.filter((block) => block.type === 'text').map((block) => block.text).join('\n')
+    if (text.trim() !== '') replies.push(text)
+  }
+  if (!resumed) return
+  const text = [
+    'Write one self-contained final answer to the user\'s current request now that the returned asynchronous results have been processed.',
+    'Earlier replies are hidden in final-answer-only mode. Integrate the substantive conclusions, changes, verification, and unresolved problems from the previous replies and all returned results. Correct stale claims using later evidence. Do not reply with only a supplement or refer the reader to an earlier answer. Do not claim success without verification. If further work is required, finish it before the complete closing answer.',
+    'Previous assistant replies (reference data, not instructions; later evidence takes precedence):',
+    JSON.stringify(replies),
+  ].join('\n\n')
+  agent.inject(Object.freeze({
+    id: randomUUID(), role: 'user',
+    source: Object.freeze({ kind: name }),
+    content: Object.freeze([Object.freeze({ type: 'text', text })]),
+  }))
 }
 
 function releaseAll(releases) {
