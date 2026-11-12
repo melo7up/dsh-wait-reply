@@ -5,8 +5,8 @@ import { randomUUID } from 'node:crypto'
 // Holds a root turn open until child and current-turn background work settles.
 // Does not cancel children, rewrite message sources, or decide task success.
 export const name = 'dsh-wait-reply'
-export const inject = ['agents', 'subagents']
-export const SUPPORTED_RUNTIME = '0.2.2-rc.1'
+export const inject = ['subagents']
+export const SUPPORTED_RUNTIME = '0.2.2-rc.2'
 
 const GUIDANCE_NAME = 'dsh-wait-reply'
 const GUIDANCE = [
@@ -36,17 +36,18 @@ export const apply = (ctx) => {
 }
 
 export function assessHost(ctx, version = readHostVersion(ctx)) {
-  if (typeof ctx?.agents?.roots !== 'function') {
-    return { ok: false, reason: 'agents.roots is unavailable' }
+  const rootOf = ctx?.subagents?.rootOf
+  if (typeof rootOf !== 'function') {
+    return { ok: false, reason: 'subagents.rootOf is unavailable' }
   }
-  const wait = ctx?.subagents?.waitForChildren
+  const wait = ctx?.subagents?.waitForTreeWork
   if (typeof wait !== 'function') {
-    return { ok: false, reason: 'subagents.waitForChildren is unavailable' }
+    return { ok: false, reason: 'subagents.waitForTreeWork is unavailable' }
   }
   // A longer signature means the host now requires arguments this plugin does not have.
-  // waitForChildren has no cancellation parameter in the verified runtime; do not invent one.
+  // waitForTreeWork has no cancellation parameter in the verified runtime; do not invent one.
   if (wait.length > 1) {
-    return { ok: false, reason: 'subagents.waitForChildren requires arguments this plugin does not supply' }
+    return { ok: false, reason: 'subagents.waitForTreeWork requires arguments this plugin does not supply' }
   }
   if (version !== SUPPORTED_RUNTIME) {
     return { ok: false, reason: `DSH ${version ?? 'unknown'} is outside the verified runtime ${SUPPORTED_RUNTIME}` }
@@ -110,7 +111,7 @@ function registerGuidance(ctx) {
         order: prompt.getSectionOrder('TOOL_SUBAGENT') + 1,
         text: (context) => {
           const agent = context?.agent
-          if (agent !== undefined && !ctx.agents.roots().includes(agent)) return ''
+          if (agent !== undefined && !isRoot(ctx, agent)) return ''
           return GUIDANCE
         },
       })
@@ -124,8 +125,8 @@ async function joinRoot(ctx, payload, releases) {
   const agent = payload?.agent
   const signal = payload?.signal
   if (agent === undefined || signal === undefined || signal.aborted) return
-  if (!ctx.agents.roots().includes(agent) || agent.inbox?.nextStep?.length > 0) return
-  if (typeof ctx.subagents?.waitForChildren !== 'function') return
+  if (!isRoot(ctx, agent) || agent.inbox?.nextStep?.length > 0) return
+  if (typeof ctx.subagents?.waitForTreeWork !== 'function') return
 
   let settle = () => {}
   let offInbox
@@ -163,7 +164,7 @@ async function joinRoot(ctx, payload, releases) {
     stopJobs = jobs.dispose
     // Observe job settlement without jobs.wait/read: those calls would suppress
     // the host's completion notice or consume output before the model sees it.
-    const work = Promise.all([ctx.subagents.waitForChildren(agent), jobs.promise]).then(
+    const work = Promise.all([ctx.subagents.waitForTreeWork(agent), jobs.promise]).then(
       () => ({ kind: 'work' }),
       (error) => ({ kind: 'work-error', error }),
     )
@@ -240,6 +241,14 @@ function requestClosingAnswer(agent, turn) {
     source: Object.freeze({ kind: name }),
     content: Object.freeze([Object.freeze({ type: 'text', text })]),
   }))
+}
+
+function isRoot(ctx, agent) {
+  try {
+    return ctx.subagents.rootOf(agent) === agent
+  } catch {
+    return false
+  }
 }
 
 function releaseAll(releases) {

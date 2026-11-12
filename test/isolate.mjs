@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict'
 import { randomUUID } from 'node:crypto'
-import { existsSync } from 'node:fs'
+import { existsSync, realpathSync } from 'node:fs'
 import { mkdir, mkdtemp, readFile, symlink, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
@@ -76,8 +76,9 @@ const uiSection = (start, end) => {
   return uiSource.slice(offset, limit)
 }
 const ui = vm.createContext({})
-vm.runInContext(uiSection('function hasAssistantReplyContent(blocks)', '\n\t\t//#endregion')
-  + uiSection('function isFinalAssistant(data)', '\n\t\tfunction processSpec('), ui)
+vm.runInContext(uiSection('function hasAssistantReplyContent(blocks)', 'function sameTurnProcessSpec')
+  + uiSection('function isFinalAssistant(data)', 'function latestAnswer')
+  + uiSection('function latestAnswer(turn)', 'function processSpec'), ui)
 
 function selectedAnswer(agent) {
   const events = agent.session.snapshotEvents()
@@ -100,10 +101,16 @@ function packagesDir() {
   const explicit = flag >= 0 ? process.argv[flag + 1] : process.env.DSH_PACKAGES
   const candidates = [
     explicit,
+    process.env.DSH_INSTALL_DIR ? join(process.env.DSH_INSTALL_DIR, '..') : undefined,
     '/Applications/DeepSeek Harness.app/Contents/Resources/app/dsh/node_modules/@deepseek-ai',
   ].filter(Boolean)
   for (const dir of candidates) {
-    if (existsSync(join(dir, 'dsh-app-boot', 'package.json'))) return dir
+    const marker = join(dir, 'dsh-app-boot', 'package.json')
+    if (!existsSync(marker)) continue
+    // The profile loader realpath's this directory. An app.asar path is not a real directory.
+    try {
+      if (!realpathSync(marker).includes('.asar')) return dir
+    } catch { /* not a usable host tree */ }
   }
   throw new Error('Pass --packages <path-to-@deepseek-ai> or set DSH_PACKAGES')
 }
@@ -332,7 +339,9 @@ async function runCase(hold, goal, extra = {}) {
     await until(() => state.started.size === 2, 'two real children started')
     if (hold) {
       await untilHeld(state)
-      const child = childrenOf(state).find((agent) => !ctx.agents.roots().includes(agent))
+      const child = childrenOf(state).find((agent) => {
+        try { return ctx.subagents.rootOf(agent) !== agent } catch { return false }
+      })
       assert.ok(child, 'expected a non-root child agent')
       assert.doesNotMatch(await renderedPrompt(child), /keeps that root turn open/)
     } else {

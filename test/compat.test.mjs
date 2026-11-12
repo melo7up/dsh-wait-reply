@@ -6,16 +6,15 @@ import test from 'node:test'
 import { apply, assessHost, hostVersionFromText, SUPPORTED_RUNTIME } from '../index.js'
 
 function host(waitLength = 1) {
-  function waitForChildren(parent) {}
+  function rootOf(agent) { return agent }
+  function waitForTreeWork(root) {}
   if (waitLength > 1) {
     return {
-      agents: { roots() { return [] } },
-      subagents: { waitForChildren(parent, signal) {} },
+      subagents: { rootOf, waitForTreeWork(root, signal) {} },
     }
   }
   return {
-    agents: { roots() { return [] } },
-    subagents: { waitForChildren },
+    subagents: { rootOf, waitForTreeWork },
   }
 }
 
@@ -29,9 +28,9 @@ test('a different or unknown runtime stays inactive', () => {
 })
 
 test('a missing or longer child-wait method stays inactive', () => {
-  assert.match(assessHost({ agents: { roots() {} }, subagents: {} }, SUPPORTED_RUNTIME).reason, /waitForChildren/)
+  assert.match(assessHost({ subagents: { rootOf() {} } }, SUPPORTED_RUNTIME).reason, /waitForTreeWork/)
   assert.match(assessHost(host(2), SUPPORTED_RUNTIME).reason, /arguments/)
-  assert.match(assessHost({ subagents: { waitForChildren() {} } }, SUPPORTED_RUNTIME).reason, /roots/)
+  assert.match(assessHost({ subagents: { waitForTreeWork() {} } }, SUPPORTED_RUNTIME).reason, /rootOf/)
 })
 
 test('an encoded file URL in a stack still resolves the host package', async () => {
@@ -49,8 +48,7 @@ test('apply does not register a listener when the host cannot be verified', () =
   let registered = false
   const warnings = []
   apply({
-    agents: { roots() { return [] } },
-    subagents: { waitForChildren() {} },
+    subagents: { rootOf(agent) { return agent }, waitForTreeWork() {} },
     logger: { warn: (message) => warnings.push(message) },
     on() { registered = true },
   })
