@@ -6,7 +6,9 @@ import { randomUUID } from 'node:crypto'
 // Does not cancel children, rewrite message sources, or decide task success.
 export const name = 'dsh-wait-reply'
 export const inject = ['subagents']
-export const SUPPORTED_RUNTIME = '0.2.2-rc.2'
+// Same range as package.json engines.dsh. DSH compares it with includePrerelease,
+// so this covers 0.2.2-rc.2 onward through 0.2.x, and stops before 0.3.0-rc.1.
+export const SUPPORTED_RANGE = '^0.2.2-rc.2'
 
 const GUIDANCE_NAME = 'dsh-wait-reply'
 const GUIDANCE = [
@@ -49,8 +51,8 @@ export function assessHost(ctx, version = readHostVersion(ctx)) {
   if (wait.length > 1) {
     return { ok: false, reason: 'subagents.waitForTreeWork requires arguments this plugin does not supply' }
   }
-  if (version !== SUPPORTED_RUNTIME) {
-    return { ok: false, reason: `DSH ${version ?? 'unknown'} is outside the verified runtime ${SUPPORTED_RUNTIME}` }
+  if (!runtimeSupported(version)) {
+    return { ok: false, reason: `DSH ${version ?? 'unknown'} is outside ${SUPPORTED_RANGE}` }
   }
   return { ok: true, version }
 }
@@ -262,6 +264,54 @@ function warn(ctx, message) {
 
 function isInactive(error) {
   return error?.code === 'INACTIVE_EFFECT' || String(error?.message ?? error).includes('INACTIVE_EFFECT')
+}
+
+const RANGE_MIN = Object.freeze({ major: 0, minor: 2, patch: 2, pre: Object.freeze(['rc', '2']) })
+const RANGE_MAX = Object.freeze({ major: 0, minor: 3, patch: 0, pre: Object.freeze(['0']) })
+
+export function runtimeSupported(version) {
+  const parsed = parseVersion(version)
+  if (parsed === undefined) return false
+  return compareVersion(parsed, RANGE_MIN) >= 0 && compareVersion(parsed, RANGE_MAX) < 0
+}
+
+function parseVersion(version) {
+  if (typeof version !== 'string') return undefined
+  const match = /^(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)(?:-([0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*))?(?:\+[0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*)?$/.exec(version)
+  if (match === null) return undefined
+  const pre = match[4] === undefined ? null : match[4].split('.')
+  if (pre?.some((part) => /^0\d+$/.test(part))) return undefined
+  return { major: Number(match[1]), minor: Number(match[2]), patch: Number(match[3]), pre }
+}
+
+function compareVersion(left, right) {
+  if (left.major !== right.major) return left.major - right.major
+  if (left.minor !== right.minor) return left.minor - right.minor
+  if (left.patch !== right.patch) return left.patch - right.patch
+  return comparePrerelease(left.pre, right.pre)
+}
+
+function comparePrerelease(left, right) {
+  if (left === null && right === null) return 0
+  if (left === null) return 1
+  if (right === null) return -1
+  const length = Math.max(left.length, right.length)
+  for (let index = 0; index < length; index += 1) {
+    if (index >= left.length) return -1
+    if (index >= right.length) return 1
+    const order = compareIdentifier(left[index], right[index])
+    if (order !== 0) return order
+  }
+  return 0
+}
+
+function compareIdentifier(left, right) {
+  const leftNumeric = /^(0|[1-9]\d*)$/.test(left)
+  const rightNumeric = /^(0|[1-9]\d*)$/.test(right)
+  if (leftNumeric && rightNumeric) return Number(left) - Number(right)
+  if (leftNumeric) return -1
+  if (rightNumeric) return 1
+  return left < right ? -1 : left > right ? 1 : 0
 }
 
 function readPackageVersion(file) {
